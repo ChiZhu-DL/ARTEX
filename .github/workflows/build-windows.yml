@@ -1,0 +1,68 @@
+name: build-windows-amd64
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（留空则自动取 git describe）"
+        required: false
+        type: string
+        default: ""
+      compress:
+        description: "UPX 压缩"
+        required: false
+        type: choice
+        default: "off"
+        options:
+          - "off"
+          - "required"
+
+permissions:
+  contents: read
+
+jobs:
+  # 单目标构建：Windows 11 x86-64 (GOOS=windows / GOARCH=amd64)
+  # build.sh 内部会先构建前端静态资源再交叉编译，无需额外 job 拆分。
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build and package windows/amd64
+        env:
+          ARTEX_TARGET_OS: windows
+          ARTEX_TARGET_ARCH: amd64
+          ARTEX_BUILD_VERSION: ${{ inputs.version }}
+          ARTEX_COMPRESS: ${{ inputs.compress }}
+          ARTEX_PACKAGE: "1"
+          ARTEX_PACKAGE_DIR: dist
+        run: ./build.sh --target windows/amd64
+
+      - name: Verify binary
+        run: |
+          set -euo pipefail
+          exe=dist/artex-windows-amd64/artex.exe
+          test -f "$exe" || { echo "未生成 $exe"; exit 1; }
+          file "$exe"
+          ls -lh "$exe" dist/*.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artex-windows-amd64
+          path: |
+            dist/*.zip
+            dist/artex-windows-amd64/artex.exe
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
