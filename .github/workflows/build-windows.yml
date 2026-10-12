@@ -20,50 +20,60 @@ on:
 permissions:
   contents: read
 
-jobs:
-  # 单目标构建：Windows 11 x86-64 (GOOS=windows / GOARCH=amd64)
-  # build.sh 内部会先构建前端静态资源再交叉编译，无需额外 job 拆分。
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+# 同一分支重复触发时取消旧运行，避免排队浪费额度
+concurrency:
+  group: build-windows-amd64-${{ github.ref }}
+  cancel-in-progress: true
 
-      - uses: actions/setup-node@v4
+env:
+  ARTEX_TARGET_OS: windows
+  ARTEX_TARGET_ARCH: amd64
+  ARTEX_PACKAGE: "1"
+  ARTEX_PACKAGE_DIR: dist
+
+jobs:
+  # ① 在 ubuntu 上交叉编译（GOOS=windows / GOARCH=amd64）
+  # build.sh 内部会先构建前端静态资源再编译，无需拆分 job。
+  build:
+    name: 交叉编译
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.26"
           cache: true
 
       - name: Build and package windows/amd64
         env:
-          ARTEX_TARGET_OS: windows
-          ARTEX_TARGET_ARCH: amd64
           ARTEX_BUILD_VERSION: ${{ inputs.version }}
           ARTEX_COMPRESS: ${{ inputs.compress }}
-          ARTEX_PACKAGE: "1"
-          ARTEX_PACKAGE_DIR: dist
-        run: ./build.sh --target windows/amd64
+        run: ./build.sh --target "$ARTEX_TARGET_OS/$ARTEX_TARGET_ARCH"
 
-      - name: Verify package contents
+      # 这里只做「工具链一定装得上」的最小校验：交叉编译只能证明格式对，
+      # 证明不了 exe 在 Windows 上能不能跑、包里东西齐不齐——那是 smoke-test 的事。
+      # 不要在这里解包校验，ubuntu runner 镜像里不保证有 unzip。
+      - name: 确认产物已生成
+        shell: bash
         run: |
           set -euo pipefail
-          file dist/artex-windows-amd64/artex.exe
-          ls -lh dist/*.zip
-          # 只发打包好的 zip，不发裸 exe：裸 exe 没有 start.bat / config.example.json，
+          exe="dist/artex-$ARTEX_TARGET_OS-$ARTEX_TARGET_ARCH/artex.exe"
+          test -s "$exe" || { echo "未生成 $exe"; exit 1; }
+          file "$exe"
+          ls -lh dist
+          # 只上传打包好的 zip，不上传裸 exe：裸 exe 缺 start.bat / config.example.json，
           # 用户双击就会因缺数据库配置而闪退（README 明确要求走守护脚本启动）。
-          unzip -l dist/*.zip
-          names=$(unzip -Z1 dist/*.zip)
-          for f in artex.exe start.bat config.example.json README.md; do
-            echo "$names" | grep -qxF "$f" || echo "$names" | grep -qxF "*/$f" || {
-              echo "压缩包缺少 $f"; exit 1; }
-          done
+          ls dist/*.zip >/dev/null
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: artex-windows-amd64
           path: |
@@ -72,26 +82,94 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # 真 Windows 上冒烟：确认交叉编译出来的 exe 在本机能执行，
-  # 且包内启动所需文件齐全（交叉编译只能验证格式，验证不了能不能跑）。
+  # ② 真 Windows 上验证：交叉编译的 exe 能不能执行、包内启动所需文件齐不齐。
+  # 这一步是唯一的权威校验点，build job 不重复做。
   smoke-test:
+    name: Windows 冒烟测试
     needs: build
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           name: artex-windows-amd64
           path: dist
-      - name: Extract and run artex.exe -h
+
+      - name: 校验 SHA256 并解包
         shell: pwsh
         run: |
           $zip = Get-ChildItem dist\*.zip | Select-Object -First 1
-          Expand-Archive -Path $zip -DestinationPath pkg
+          if (-not $zip) { throw '产物里没有 zip' }
+          $line = Get-Content dist\SHA256SUMS | Select-Object -First 1
+          if ($line) {
+            $expect = ($line -split '\s+')[0]
+            $actual = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash
+            if ($expect -ne $actual) { throw "SHA256 不匹配：期望 $expect，实际 $actual" }
+            "SHA256 校验通过：$actual"
+          }
+          Expand-Archive -Path $zip.FullName -DestinationPath pkg
+
+      - name: 校验包内文件齐全
+        shell: pwsh
+        run: |
           $dir = Get-ChildItem pkg -Directory | Select-Object -First 1
-          foreach ($f in @('artex.exe','start.bat','config.example.json')) {
+          if (-not $dir) { throw 'zip 解压后没有目录' }
+          foreach ($f in @('artex.exe', 'start.bat', 'config.example.json', 'README.md')) {
             if (-not (Test-Path (Join-Path $dir.FullName $f))) { throw "包内缺少 $f" }
           }
-          $out = & (Join-Path $dir.FullName 'artex.exe') -h 2>&1
+          if (-not (Test-Path (Join-Path $dir.FullName 'skills'))) { throw '包内缺少 skills/' }
+          "包内文件齐全：$($dir.Name)"
+
+      - name: 实跑 artex.exe -h
+        shell: pwsh
+        run: |
+          $dir = Get-ChildItem pkg -Directory | Select-Object -First 1
+          $exe = Join-Path $dir.FullName 'artex.exe'
+          $out = & $exe -h 2>&1
           $code = $LASTEXITCODE
           $out | Out-String | Write-Host
           if ($code -ne 0) { throw "artex.exe -h 退出码 $code" }
+          "artex.exe 在 Windows 上可执行"
+
+      # 回归测试：用户之前遇到的「双击闪退」就是缺数据库配置时进程无提示秒退。
+      # 这里锁定不变量：要么正常起来，要么以非 0 退出且说清原因，绝不允许静默消失。
+      - name: 回归：缺配置时不得静默闪退
+        shell: pwsh
+        run: |
+          $dir = Get-ChildItem pkg -Directory | Select-Object -First 1
+          $exe = Join-Path $dir.FullName 'artex.exe'
+          $outFile = Join-Path $env:RUNNER_TEMP 'boot.out.txt'
+          $errFile = Join-Path $env:RUNNER_TEMP 'boot.err.txt'
+          $p = Start-Process -FilePath $exe -NoNewWindow -PassThru `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+          if ($p.WaitForExit(45000)) {
+            $text = (Get-Content $outFile, $errFile -Raw -ErrorAction SilentlyContinue) -join "`n"
+            "退出码：$($p.ExitCode)"
+            $text | Out-String | Write-Host
+            if ($p.ExitCode -eq 0) { throw '没有数据库配置却以 0 退出' }
+            if (-not $text.Trim()) { throw '进程无任何输出就退出（用户遇到的就是这种闪退）' }
+            if ($text -notmatch 'ARTEX_PG_DSN|数据库配置') {
+              throw "退出原因不可读，没有提示数据库配置：`n$text"
+            }
+          } else {
+            '45 秒内未退出：进程存活并已在服务（可接受）'
+            Stop-Process -Id $p.Id -Force
+          }
+
+      - name: 写入运行摘要
+        if: always()
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem dist\*.zip | Select-Object -First 1
+          if (-not $zip) { return }
+          $hash = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash
+          @"
+          ### Windows amd64 构建产物
+
+          | 文件 | 大小 | SHA256 |
+          | --- | --- | --- |
+          | ``$($zip.Name)`` | $([math]::Round($zip.Length / 1MB, 1)) MB | ``$hash`` |
+
+          下载 artifact 解压后：复制 ``config.example.json`` 为 ``config.json`` 填好数据库，
+          然后双击 ``start.bat``（不要直接运行 ``artex.exe``）。
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
