@@ -49,20 +49,49 @@ jobs:
           ARTEX_PACKAGE_DIR: dist
         run: ./build.sh --target windows/amd64
 
-      - name: Verify binary
+      - name: Verify package contents
         run: |
           set -euo pipefail
-          exe=dist/artex-windows-amd64/artex.exe
-          test -f "$exe" || { echo "未生成 $exe"; exit 1; }
-          file "$exe"
-          ls -lh "$exe" dist/*.zip
+          file dist/artex-windows-amd64/artex.exe
+          ls -lh dist/*.zip
+          # 只发打包好的 zip，不发裸 exe：裸 exe 没有 start.bat / config.example.json，
+          # 用户双击就会因缺数据库配置而闪退（README 明确要求走守护脚本启动）。
+          unzip -l dist/*.zip
+          names=$(unzip -Z1 dist/*.zip)
+          for f in artex.exe start.bat config.example.json README.md; do
+            echo "$names" | grep -qxF "$f" || echo "$names" | grep -qxF "*/$f" || {
+              echo "压缩包缺少 $f"; exit 1; }
+          done
 
       - uses: actions/upload-artifact@v4
         with:
           name: artex-windows-amd64
           path: |
             dist/*.zip
-            dist/artex-windows-amd64/artex.exe
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 30
+
+  # 真 Windows 上冒烟：确认交叉编译出来的 exe 在本机能执行，
+  # 且包内启动所需文件齐全（交叉编译只能验证格式，验证不了能不能跑）。
+  smoke-test:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: artex-windows-amd64
+          path: dist
+      - name: Extract and run artex.exe -h
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem dist\*.zip | Select-Object -First 1
+          Expand-Archive -Path $zip -DestinationPath pkg
+          $dir = Get-ChildItem pkg -Directory | Select-Object -First 1
+          foreach ($f in @('artex.exe','start.bat','config.example.json')) {
+            if (-not (Test-Path (Join-Path $dir.FullName $f))) { throw "包内缺少 $f" }
+          }
+          $out = & (Join-Path $dir.FullName 'artex.exe') -h 2>&1
+          $code = $LASTEXITCODE
+          $out | Out-String | Write-Host
+          if ($code -ne 0) { throw "artex.exe -h 退出码 $code" }
